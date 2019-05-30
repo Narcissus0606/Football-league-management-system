@@ -1,0 +1,230 @@
+1.插入球队触发插入积分表
+--当向球队表Team中插入一行数据时，会自动向积分榜Score中插入一条对应的数据
+create trigger teaminsert 
+on team
+for insert
+as 
+declare @name varchar(20)  //声明@name
+select @name=NAME from inserted
+insert into score(PLACE,NAME,TURN,WON,EVEN,BEATEN,GOAL,LOST,NET,POINT,YEAR) values(0,@name,0,0,0,0,0,0,0,0,0)
+
+
+
+2.删除球队触发删除射手榜、球员、比赛情况、积分榜
+--删除球队的时候由于很多其他表格都参照球队表，需要先删除从表，再删除主表——球队表，所以采用instead of类型的触发器，把球队的删除工作替换为一系列动作
+create trigger teamdel 
+on team
+instead of delete
+as
+declare @name varchar(20)
+
+/*由于删除的可能不止一支球队，所以采用游标。把删除的记录（放在deleted系统临时表中）的球队名称做成一个游标，每次从游标中取出一条，放入到临时变量@name中，然后再根据@name删除goal、member、course、score、team中的数据*/
+declare team_cursor cursor
+	for 
+		select name from deleted
+
+open team_cursor   --打开游标
+fetch next from team_cursor into @name
+while @@FETCH_STATUS=0  --@@FETCH_STATUS=0表示从游标中获取数据成功
+begin
+	delete from goal where teamname=@name
+	delete from member where teamname=@name
+	delete from course where home=@name or away=@name
+	delete from score where name=@name
+	delete from team where name=@name
+	fetch next from team_cursor into @name  --从游标中获取下一条数据
+end
+close team_cursor  --关闭游标
+deallocate team_cursor  --释放游标占用的内存资源
+
+
+
+
+3.插入比赛进程时调整积分榜
+CREATE TRIGGER COURSE_INSERT ON Course 
+FOR INSERT 
+AS
+DECLARE @Turn INTEGER,
+	@HomeTeam VARCHAR(20),
+	@AwayTeam VARCHAR(20),
+	@HomeScore INTEGER,
+	@AwayScore INTEGER,
+	@nian INTEGER
+SET @Turn=0
+SET @HomeTeam =''
+SET @AwayTeam=''
+SET @HomeScore=0
+SET @AwayScore=0
+SET @nian=0
+
+--从INSERTED表中获取插入的数据，以便进行各种情况的判断
+SELECT  @Turn=TURN,
+	@HomeTeam=HOME,
+	@AwayTeam=AWAY,
+	@HomeScore=HOMESCORE,
+	@AwayScore=AWAYSCORE,
+	@nian=YEAR(MATCHDATE)
+FROM INSERTED
+
+--如果积分榜中没有主队或客队的信息，则添加一条
+IF NOT EXISTS(SELECT NAME FROM SCORE WHERE NAME=@HomeTeam)
+INSERT INTO SCORE VALUES(0,@HomeTeam,0,0,0,0,0,0,0,0,@nian)
+IF NOT EXISTS(SELECT NAME FROM SCORE WHERE NAME=@AwayTeam)
+INSERT INTO SCORE VALUES(0,@AwayTeam,0,0,0,0,0,0,0,0,@nian)
+
+--主队获胜
+IF(@HomeScore>@AwayScore)
+BEGIN
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		WON=WON+1,
+		GOAL=GOAL+@HomeScore,
+		LOST=LOST+@AwayScore,
+		NET=NET+(@HomeScore-@AwayScore),
+		POINT=POINT+3,
+		YEAR=@nian
+	WHERE NAME=@HomeTeam
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		BEATEN=BEATEN+1,
+		GOAL=GOAL+@AwayScore,
+		LOST=LOST+@HomeScore,
+		NET=NET+(@AwayScore-@HomeScore),
+		POINT=POINT+0,
+		YEAR=@nian
+	WHERE NAME=@AwayTeam
+END
+
+--两队打平
+ELSE IF(@HomeScore=@AwayScore)
+BEGIN
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		EVEN=EVEN+1,
+		GOAL=GOAL+@HomeScore,
+		LOST=LOST+@AwayScore,
+		POINT=POINT+1,
+		YEAR=@nian
+	WHERE NAME=@HomeTeam
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		EVEN=EVEN+1,
+		GOAL=GOAL+@AwayScore,
+		LOST=LOST+@HomeScore,
+		POINT=POINT+1,
+		YEAR=@nian
+	WHERE NAME=@AwayTeam	
+END
+
+--主队失利
+ELSE
+BEGIN
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		BEATEN=BEATEN+1,
+		GOAL=GOAL+@HomeScore,
+		LOST=LOST+@AwayScore,
+		NET=NET+(@HomeScore-@AwayScore),
+		POINT=POINT+0,
+		YEAR=@nian
+	WHERE NAME=@HomeTeam
+	UPDATE SCORE
+	SET 
+		TURN=@Turn,
+		WON=WON+1,
+		GOAL=GOAL+@AwayScore,
+		LOST=LOST+@HomeScore,
+		NET=NET+(@AwayScore-@HomeScore),
+		POINT=POINT+3,
+		YEAR=@nian
+	WHERE NAME=@AwayTeam
+END
+
+--利用游标对名次进行处理
+DECLARE @name VARCHAR(20), @place INTEGER
+SET @place=0   
+
+--按照积分、净胜球、进球数的降序进行排名
+DECLARE score_cursor CURSOR
+  FOR
+  SELECT NAME FROM SCORE ORDER BY POINT DESC,NET DESC,GOAL DESC
+OPEN score_cursor 
+FETCH NEXT FROM score_cursor INTO @name
+WHILE @@FETCH_STATUS=0 
+ BEGIN
+  SET @place=@place+1
+  UPDATE SCORE SET PLACE=@place WHERE NAME=@name
+  FETCH NEXT FROM score_cursor INTO @name
+ END 
+CLOSE score_cursor 
+DEALLOCATE score_cursor 
+
+
+4.插入进球时调整射手榜
+CREATE TRIGGER goal_insert
+ON Goal FOR INSERT
+AS
+DECLARE @name varchar(20),@teamname varchar(20),@number integer
+select @teamname=TEAMNAME,@number=NUMBER from inserted
+select @name=NAME from member where teamname=@teamname and number=@number
+
+--如果射手榜中没有该球员的信息，则插入一条对应记录
+if not exists(select name from goalscore where teamname=@teamname and number=@number)
+insert into goalscore values(0,@name,@teamname,@number,0,0)
+
+--进球数加一
+update goalscore set goals=goals+1 where teamname=@teamname and number=@number
+
+--重新对射手榜进行排名
+DECLARE @place INTEGER
+SET @place=0   
+DECLARE goalscore_cursor CURSOR
+  FOR
+  SELECT TEAMNAME,NUMBER FROM GOALSCORE ORDER BY GOALS DESC,NAME
+OPEN goalscore_cursor 
+FETCH NEXT FROM goalscore_cursor INTO @teamname,@number
+WHILE @@FETCH_STATUS=0 
+ BEGIN
+  SET @place=@place+1
+  UPDATE GOALSCORE SET PLACE=@place WHERE teamname=@teamname and number=@number
+  FETCH NEXT FROM goalscore_cursor INTO @teamname,@number
+ END 
+CLOSE goalscore_cursor 
+DEALLOCATE goalscore_cursor 
+
+
+
+5.修改球队名称时自动调整相关表格中的球队名称
+create trigger TeamUpdate
+on Team
+instead of update
+as
+declare @oldName varchar(20)
+declare @oldHome varchar(30)
+declare @oldCoach varchar(20)
+declare @newName varchar(20)
+declare @newHome varchar(30)
+declare @newCoach varchar(20)
+
+select @oldName=name, @oldHome=home, @oldCoach=coach from deleted
+select @newName=name, @newHome=home, @newCoach=coach from inserted
+if (@oldName<>@newName)
+begin
+	begin transaction
+		insert into team(name,home,coach) values(@newName,@newhome,@newCoach)
+		delete from score where name=@newName
+		update goal set teamname=@newName where teamname=@oldName
+		update member set teamname=@newName where teamname=@oldName
+		update course set home=@newName where home=@oldName
+		update course set away=@newName where away=@oldName
+		update score set name=@newName where name=@oldName
+		delete from team where name=@oldName
+	commit
+end
+else
+	update team set home=@newhome, coach=@newCoach where name=@oldName
